@@ -37,6 +37,8 @@ export default {
                     return new Response(JSON.stringify(await SOCKS5可用性验证('socks5', 代理参数.split("socks5://")[1])));
                 } else if (代理参数.toLowerCase().startsWith("http://")) {
                     return new Response(JSON.stringify(await SOCKS5可用性验证('http', 代理参数.split("http://")[1])));
+                } else if (代理参数.toLowerCase().startsWith("https://")) {
+                    return new Response(JSON.stringify(await SOCKS5可用性验证('https', 代理参数.split("https://")[1])));
                 }
             }
             // 如果没有提供有效的代理参数，返回错误响应
@@ -246,59 +248,115 @@ async function 获取SOCKS5账号(address) {
 async function httpConnect(addressRemote, portRemote) {
     const { username, password, hostname, port } = parsedSocks5Address;
     const sock = await connect({ hostname, port });
-    const authHeader = username && password ? `Proxy-Authorization: Basic ${btoa(`${username}:${password}`)}\r\n` : '';
-    const connectRequest = `CONNECT ${addressRemote}:${portRemote} HTTP/1.1\r\n` +
-        `Host: ${addressRemote}:${portRemote}\r\n` +
-        authHeader +
-        `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n` +
-        `Proxy-Connection: Keep-Alive\r\n` +
-        `Connection: Keep-Alive\r\n\r\n`;
     const writer = sock.writable.getWriter();
-    try {
-        await writer.write(new TextEncoder().encode(connectRequest));
-    } catch (err) {
-        throw new Error(`发送HTTP CONNECT请求失败: ${err.message}`);
-    } finally {
-        writer.releaseLock();
-    }
     const reader = sock.readable.getReader();
-    let responseBuffer = new Uint8Array(0);
+    
     try {
-        while (true) {
-            const { value, done } = await reader.read();
-            if (done) throw new Error('HTTP代理连接中断');
+        // 构建 HTTP CONNECT 请求
+        let connectRequest = `CONNECT ${addressRemote}:${portRemote} HTTP/1.1\r\n`;
+        connectRequest += `Host: ${addressRemote}:${portRemote}\r\n`;
+        
+        // 如果有用户名和密码,添加 Proxy-Authorization 头
+        if (username && password) {
+            const auth = btoa(`${username}:${password}`);
+            connectRequest += `Proxy-Authorization: Basic ${auth}\r\n`;
+        }
+        
+        connectRequest += `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n`;
+        connectRequest += `Proxy-Connection: Keep-Alive\r\n`;
+        connectRequest += `Connection: Keep-Alive\r\n`;
+        connectRequest += '\r\n';
+        
+        // 发送 CONNECT 请求
+        await writer.write(new TextEncoder().encode(connectRequest));
+        
+        // 读取响应头
+        let responseBuffer = new Uint8Array(0);
+        let headerEndIndex = -1;
+        let bytesRead = 0;
+        const maxHeaderSize = 8192; // 最大响应头大小
+        
+        // 循环读取数据直到找到响应头结束标记
+        while (headerEndIndex === -1 && bytesRead < maxHeaderSize) {
+            const { done, value } = await reader.read();
+            if (done) {
+                throw new Error('HTTP代理连接中断，未收到完整响应');
+            }
+            
+            // 合并新数据到缓冲区
             const newBuffer = new Uint8Array(responseBuffer.length + value.length);
             newBuffer.set(responseBuffer);
             newBuffer.set(value, responseBuffer.length);
             responseBuffer = newBuffer;
-            const respText = new TextDecoder().decode(responseBuffer);
-            if (respText.includes('\r\n\r\n')) {
-                const headersEndPos = respText.indexOf('\r\n\r\n') + 4;
-                const headers = respText.substring(0, headersEndPos);
-
-                if (!headers.startsWith('HTTP/1.1 200') && !headers.startsWith('HTTP/1.0 200')) {
-                    throw new Error(`HTTP代理连接失败: ${headers.split('\r\n')[0]}`);
+            bytesRead = responseBuffer.length;
+            
+            // 查找响应头结束标记 \r\n\r\n
+            for (let i = 0; i < responseBuffer.length - 3; i++) {
+                if (responseBuffer[i] === 0x0d && responseBuffer[i + 1] === 0x0a &&
+                    responseBuffer[i + 2] === 0x0d && responseBuffer[i + 3] === 0x0a) {
+                    headerEndIndex = i + 4;
+                    break;
                 }
-                if (headersEndPos < responseBuffer.length) {
-                    const remainingData = responseBuffer.slice(headersEndPos);
-                    const { readable, writable } = new TransformStream();
-                    new ReadableStream({
-                        start(controller) {
-                            controller.enqueue(remainingData);
-                        }
-                    }).pipeTo(writable).catch(() => { });
-                    // @ts-ignore
-                    sock.readable = readable;
-                }
-                break;
             }
         }
-    } catch (err) {
-        throw new Error(`处理HTTP代理响应失败: ${err.message}`);
-    } finally {
+        
+        if (headerEndIndex === -1) {
+            throw new Error('HTTP代理响应格式无效，未找到响应头结束标记');
+        }
+        
+        // 解析响应头
+        const headerText = new TextDecoder().decode(responseBuffer.slice(0, headerEndIndex));
+        const statusLine = headerText.split('\r\n')[0];
+        const statusMatch = statusLine.match(/HTTP\/\d\.\d\s+(\d+)/);
+        
+        if (!statusMatch) {
+            throw new Error(`HTTP代理响应格式无效: ${statusLine}`);
+        }
+        
+        const statusCode = parseInt(statusMatch[1]);
+        
+        // 检查状态码,支持 2xx 成功状态码
+        if (statusCode < 200 || statusCode >= 300) {
+            throw new Error(`HTTP代理连接失败 [${statusCode}]: ${statusLine}`);
+        }
+        
+        // 如果响应中有多余的数据(通常不应该有),需要处理
+        // 通过创建新的可读流来传递这些数据
+        if (headerEndIndex < responseBuffer.length) {
+            const remainingData = responseBuffer.slice(headerEndIndex);
+            const { readable, writable } = new TransformStream();
+            
+            // 将剩余数据写入新流
+            new ReadableStream({
+                start(controller) {
+                    controller.enqueue(remainingData);
+                }
+            }).pipeTo(writable).catch(() => {});
+            
+            // 替换 socket 的 readable 流
+            // @ts-ignore
+            sock.readable = readable;
+        }
+        
+        writer.releaseLock();
         reader.releaseLock();
+        
+        return sock;
+        
+    } catch (error) {
+        // 清理资源
+        try {
+            writer.releaseLock();
+        } catch (e) {}
+        try {
+            reader.releaseLock();
+        } catch (e) {}
+        try {
+            sock.close();
+        } catch (e) {}
+        
+        throw new Error(`HTTP代理连接失败: ${error.message}`);
     }
-    return sock;
 }
 
 async function socks5Connect(addressRemote, portRemote, addressType = 3) {

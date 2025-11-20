@@ -1488,20 +1488,26 @@ async function HTML(网站图标, 网络备案, img) {
             // 计算基础评分：(company + asn) / 2 * 5
             let baseScore = ((company + asn) / 2) * 5;
             
-            // 计算安全风险附加分：每个安全风险项增加 15%
+            // 计算安全风险附加分
             let riskAddition = 0;
-            const riskFlags = [
+            
+            // 检查虚假IP (Bogon)，如果是则增加100%
+            if (securityFlags.is_bogon === true) {
+                riskAddition += 1.0; // 虚假IP增加100%
+            }
+            
+            // 其他风险项各增加15%
+            const otherRiskFlags = [
                 securityFlags.is_crawler,   // 爬虫
                 securityFlags.is_proxy,     // 代理服务器
                 securityFlags.is_vpn,       // VPN
                 securityFlags.is_tor,       // Tor 网络
-                securityFlags.is_abuser,    // 滥用 IP
-                securityFlags.is_bogon      // 虚假 IP
+                securityFlags.is_abuser     // 滥用 IP
             ];
             
-            // 统计为 true 的风险项数量
-            const riskCount = riskFlags.filter(flag => flag === true).length;
-            riskAddition = riskCount * 0.15; // 每个风险项增加 15%
+            // 统计其他风险项中为 true 的数量
+            const otherRiskCount = otherRiskFlags.filter(flag => flag === true).length;
+            riskAddition += otherRiskCount * 0.15; // 每个风险项增加 15%
             
             // 最终评分 = 基础评分 + 风险附加分
             const finalScore = baseScore + riskAddition;
